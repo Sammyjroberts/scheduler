@@ -1,26 +1,49 @@
 package scheduler
 
 import (
+	"context"
 	"sort"
+
+	"github.com/uptrace/opentelemetry-go-extra/otelzap"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
+type SchedulerConfig struct {
+	fx.In
+	Logger *otelzap.Logger
+}
+
+func NewScheduler(cfg SchedulerConfig) *Scheduler {
+	return &Scheduler{
+		logger: cfg.Logger,
+	}
+}
+
+type Scheduler struct {
+	logger *otelzap.Logger
+}
+
 // isZeroDuration checks if a task has zero duration
-func isZeroDuration(task Task) bool {
+func (s *Scheduler) isZeroDuration(task Task) bool {
 	return !task.EndTime.After(task.StartTime)
 }
 
 // tasksConflict checks if two tasks overlap, treating zero duration tasks as regular tasks
-func tasksConflict(task1, task2 Task) bool {
+func (s *Scheduler) tasksConflict(task1, task2 Task) bool {
 	// For zero duration tasks, they conflict if they happen at the same instant
-	if isZeroDuration(task1) && isZeroDuration(task2) {
+	if s.isZeroDuration(task1) && s.isZeroDuration(task2) {
 		return task1.StartTime.Equal(task2.StartTime)
 	}
 
 	// If one task is zero duration, it conflicts if it occurs during the other task
-	if isZeroDuration(task1) {
+	if s.isZeroDuration(task1) {
 		return !task1.StartTime.Before(task2.StartTime) && !task1.StartTime.After(task2.EndTime)
 	}
-	if isZeroDuration(task2) {
+	if s.isZeroDuration(task2) {
 		return !task2.StartTime.Before(task1.StartTime) && !task2.StartTime.After(task1.EndTime)
 	}
 
@@ -33,7 +56,7 @@ func tasksConflict(task1, task2 Task) bool {
 // We've sorted by end time
 // When we use this result, we then look up that task's accumulated best priority in bestPriorityUpToTask
 // The dynamic programming table has already calculated the optimal priority for all previous positions
-func findBestPreviousTask(tasks []Task, currentTaskIndex int) int {
+func (s *Scheduler) findBestPreviousTask(tasks []Task, currentTaskIndex int) int {
 	currentTask := tasks[currentTaskIndex]
 
 	// Binary search through previous tasks
@@ -45,7 +68,7 @@ func findBestPreviousTask(tasks []Task, currentTaskIndex int) int {
 		middleTask := (startSearch + endSearch) / 2
 
 		// Check for conflict
-		if !tasksConflict(tasks[middleTask], currentTask) {
+		if !s.tasksConflict(tasks[middleTask], currentTask) {
 			bestPreviousTask = middleTask
 			startSearch = middleTask + 1 // Look for an even later task
 		} else {
@@ -57,10 +80,16 @@ func findBestPreviousTask(tasks []Task, currentTaskIndex int) int {
 }
 
 // FindBestSchedule finds the combination of tasks that gives us the highest total priority
-func FindBestSchedule(tasks []Task) ([]Task, float64) {
+func (s *Scheduler) FindBestSchedule(tasks []Task) ([]Task, float64, []RejectedTask) {
+	ctx, span := otel.GetTracerProvider().Tracer("scheduler").Start(context.Background(), "FindBestSchedule")
+	defer span.End()
+	logger := s.logger.Ctx(ctx)
+	span.SetAttributes(attribute.Int("num_tasks", len(tasks)))
+	logger.Info("Starting scheduler", zap.Int("num_tasks", len(tasks)))
+	rejectedTasks := []RejectedTask{}
 	// if there are no tasks, return nil
 	if len(tasks) == 0 {
-		return nil, 0
+		return nil, 0, nil
 	}
 
 	// Sort tasks by end time - zero duration tasks are sorted by their start time
@@ -68,10 +97,10 @@ func FindBestSchedule(tasks []Task) ([]Task, float64) {
 		// For zero duration tasks, use their start time
 		firstTime := tasks[first].EndTime
 		secondTime := tasks[second].EndTime
-		if isZeroDuration(tasks[first]) {
+		if s.isZeroDuration(tasks[first]) {
 			firstTime = tasks[first].StartTime
 		}
-		if isZeroDuration(tasks[second]) {
+		if s.isZeroDuration(tasks[second]) {
 			secondTime = tasks[second].StartTime
 		}
 		return firstTime.Before(secondTime)
@@ -92,7 +121,7 @@ func FindBestSchedule(tasks []Task) ([]Task, float64) {
 		// Find the index of the latest task that finishes before the current task starts
 		// and does not overlap with it. This is the best candidate to have been
 		// included in the schedule *before* the current task.
-		bestPrevious := findBestPreviousTask(tasks, currentTask)
+		bestPrevious := s.findBestPreviousTask(tasks, currentTask)
 
 		// Calculate the total priority if we *include* the current task.
 		priorityIfIncluded := tasks[currentTask].Priority
@@ -124,11 +153,58 @@ func FindBestSchedule(tasks []Task) ([]Task, float64) {
 			// as the one chosen for the previous iteration. This maintains the chain
 			// of chosen tasks for backtracking.
 			previousTaskChosen[currentTask] = previousTaskChosen[currentTask-1]
+			// Record low priority rejection
+			span.AddEvent("task_rejected", trace.WithAttributes(attribute.String("reason", "low_priority")))
+			rejectedTasks = append(rejectedTasks, RejectedTask{
+				TaskRejected: tasks[currentTask],
+				Reason:       RejectionReasonLowPriority,
+			})
 		}
 	}
 
 	// Build our list of chosen tasks
 	chosenTasks := make([]Task, 0)
+	// Build chosen tasks list and track conflicts
+	chosenIndexes := make(map[int]bool)
+
+	for i := numTasks - 1; i >= 0; {
+		if i == 0 || bestPriorityUpToTask[i] != bestPriorityUpToTask[i-1] {
+			chosenTasks = append(chosenTasks, tasks[i])
+			chosenIndexes[i] = true
+			i = previousTaskChosen[i]
+		} else {
+			i--
+		}
+	}
+
+	// Find conflict rejections
+	for i := 0; i < numTasks; i++ {
+		if !chosenIndexes[i] {
+			// Check if already rejected for low priority
+			alreadyRejected := false
+			for _, rejected := range rejectedTasks {
+				if rejected.TaskRejected == tasks[i] {
+					alreadyRejected = true
+					break
+				}
+			}
+
+			if !alreadyRejected {
+				// Find conflicting task
+				for j := 0; j < numTasks; j++ {
+					if chosenIndexes[j] && s.tasksConflict(tasks[i], tasks[j]) {
+						span.AddEvent("task_rejected", trace.WithAttributes(attribute.String("reason", "conflict")))
+						rejectedTasks = append(rejectedTasks, RejectedTask{
+							TaskRejected: tasks[i],
+							CausedBy:     &tasks[j],
+							Reason:       RejectionReasonConflict,
+						})
+						break
+					}
+				}
+			}
+		}
+	}
 	for i := numTasks - 1; i >= 0; {
 		if i == 0 || bestPriorityUpToTask[i] != bestPriorityUpToTask[i-1] {
 			chosenTasks = append(chosenTasks, tasks[i])
@@ -142,6 +218,9 @@ func FindBestSchedule(tasks []Task) ([]Task, float64) {
 	for i := 0; i < len(chosenTasks)/2; i++ {
 		chosenTasks[i], chosenTasks[len(chosenTasks)-1-i] = chosenTasks[len(chosenTasks)-1-i], chosenTasks[i]
 	}
-
-	return chosenTasks, bestPriorityUpToTask[numTasks-1]
+	span.AddEvent("scheduler_finished", trace.WithAttributes(attribute.Int("num_chosen_tasks", len(chosenTasks)), attribute.Int("num_rejected_tasks", len(rejectedTasks))))
+	logger.Info("Scheduler finished", zap.Int("num_chosen_tasks", len(chosenTasks)), zap.Int("num_rejected_tasks", len(rejectedTasks)))
+	return chosenTasks, bestPriorityUpToTask[numTasks-1], rejectedTasks
 }
+
+var Module = fx.Provide(NewScheduler)

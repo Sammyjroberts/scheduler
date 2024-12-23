@@ -164,3 +164,8 @@ The repository includes an HTML visualizer that shows:
 - [Weighted Interval Scheduling](https://en.wikipedia.org/wiki/Interval_scheduling#Weighted)
 - [Dynamic Programming](https://en.wikipedia.org/wiki/Dynamic_programming)
 - [Binary Search](https://en.wikipedia.org/wiki/Binary_search_algorithm)
+
+## Future Implementation for multi-user scheduling
+
+- [Constraint Programming](https://arxiv.org/html/2412.10272v1)
+- [Integer Linear Programming](https://apmonitor.com/wiki/index.php/Main/IntegerProgramming#:~:text=Integer%20Linear%20Programming%20(ILP)%20is,function%20and%20equations%20are%20linear.&text=A%20Mixed%2DInteger%20Linear%20Programming,has%20continuous%20and%20integer%20variables.)

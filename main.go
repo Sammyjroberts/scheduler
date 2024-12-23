@@ -1,17 +1,32 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"time"
+	"turionspace/nei-mission-planner/scheduler/config"
+	"turionspace/nei-mission-planner/scheduler/observability"
 	"turionspace/nei-mission-planner/scheduler/scheduler"
+
+	"github.com/uptrace/opentelemetry-go-extra/otelzap"
+	"go.opentelemetry.io/otel"
+	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
-func main() {
+func runTest(
+	shutdowner fx.Shutdowner,
+	cfg *config.Config,
+	logger *otelzap.Logger, schedulerGenerator *scheduler.Scheduler) {
+	ctx, span := otel.GetTracerProvider().Tracer("run_test").Start(context.Background(), "HelloHandler")
+	defer span.End()
 	// Create a fixed start time for better readability
 	baseTime := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
-
+	loggerWithCtx := logger.Ctx(ctx)
+	// Log the start time
+	loggerWithCtx.Info("Starting scheduler", zap.String("start_time", baseTime.Format(time.RFC3339)))
 	tasks := []scheduler.Task{
 		// Morning Tasks (9:00 - 12:00)
 		{
@@ -101,26 +116,26 @@ func main() {
 		},
 	}
 
-	chosenTasks, totalPriority := scheduler.FindBestSchedule(tasks)
+	chosenTasks, totalPriority, rejectedTasks := schedulerGenerator.FindBestSchedule(tasks)
 
 	// Print results in a nice format
-	fmt.Println("\n🗓️  Optimal Schedule:")
-	fmt.Println("------------------------------------------------")
-	for _, task := range chosenTasks {
-		fmt.Printf("   Start: %s\n", task.StartTime.Format("15:04"))
-		fmt.Printf("   End: %s\n", task.EndTime.Format("15:04"))
-		fmt.Printf("   Priority: %.1f\n", task.Priority)
-		fmt.Println("------------------------------------------------")
-	}
-	fmt.Printf("\n📊 Total Priority Score: %.1f\n", totalPriority)
+	// fmt.Println("\n🗓️  Optimal Schedule:")
+	// fmt.Println("------------------------------------------------")
+	// for _, task := range chosenTasks {
+	// 	fmt.Printf("   Start: %s\n", task.StartTime.Format("15:04"))
+	// 	fmt.Printf("   End: %s\n", task.EndTime.Format("15:04"))
+	// 	fmt.Printf("   Priority: %.1f\n", task.Priority)
+	// 	fmt.Println("------------------------------------------------")
+	// }
+	// fmt.Printf("\n📊 Total Priority Score: %.1f\n", totalPriority)
 
-	// Print some statistics
-	fmt.Printf("\n📈 Schedule Statistics:")
-	fmt.Printf("\n   Total Tasks Available: %d", len(tasks))
-	fmt.Printf("\n   Tasks Scheduled: %d", len(chosenTasks))
-	fmt.Printf("\n   Time Span: %s - %s\n",
-		baseTime.Format("15:04"),
-		baseTime.Add(8*time.Hour).Format("15:04"))
+	// // Print some statistics
+	// fmt.Printf("\n📈 Schedule Statistics:")
+	// fmt.Printf("\n   Total Tasks Available: %d", len(tasks))
+	// fmt.Printf("\n   Tasks Scheduled: %d", len(chosenTasks))
+	// fmt.Printf("\n   Time Span: %s - %s\n",
+	// 	baseTime.Format("15:04"),
+	// 	baseTime.Add(8*time.Hour).Format("15:04"))
 	// Create sets for easy lookup of chosen tasks
 	chosenMap := make(map[time.Time]bool)
 	for _, task := range chosenTasks {
@@ -128,11 +143,9 @@ func main() {
 	}
 
 	// Prepare rejected tasks
-	rejectedTasks := make([]scheduler.Task, 0)
-	for _, task := range tasks {
-		if !chosenMap[task.StartTime] {
-			rejectedTasks = append(rejectedTasks, task)
-		}
+	rejectedTasksJSON := make([]scheduler.Task, 0)
+	for _, task := range rejectedTasks {
+		rejectedTasksJSON = append(rejectedTasksJSON, task.TaskRejected)
 	}
 
 	// Convert to output format
@@ -147,8 +160,8 @@ func main() {
 		}
 	}
 
-	rejectedOutput := make([]scheduler.TaskOutput, len(rejectedTasks))
-	for i, task := range rejectedTasks {
+	rejectedOutput := make([]scheduler.TaskOutput, len(rejectedTasksJSON))
+	for i, task := range rejectedTasksJSON {
 		rejectedOutput[i] = scheduler.TaskOutput{
 			StartTime:      task.StartTime.Format(time.RFC3339),
 			EndTime:        task.EndTime.Format(time.RFC3339),
@@ -165,7 +178,7 @@ func main() {
 		Statistics: scheduler.Statistics{
 			TotalTasks:     len(tasks),
 			ScheduledTasks: len(chosenTasks),
-			RejectedTasks:  len(rejectedTasks),
+			RejectedTasks:  len(rejectedTasksJSON),
 		},
 		TimeRange: scheduler.TimeRange{
 			Start: baseTime.Format(time.RFC3339),
@@ -180,12 +193,37 @@ func main() {
 		return
 	}
 
-	// Print JSON
-	fmt.Println(string(jsonData))
 	// save to file
 	err = os.WriteFile("output.json", jsonData, 0644)
 	if err != nil {
 		fmt.Printf("Error writing JSON to file: %v\n", err)
 		return
+	}
+	loggerWithCtx.Info("Scheduler completed", zap.String("output_file", "output.json"))
+
+}
+
+func main() {
+	app := fx.New(
+		config.Module,
+		observability.Module,
+		scheduler.Module,
+		fx.Invoke(runTest),
+	)
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := app.Start(startCtx); err != nil {
+		fmt.Printf("Failed to start application: %v\n", err)
+		os.Exit(1)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := app.Stop(stopCtx); err != nil {
+		fmt.Printf("Failed to stop application: %v\n", err)
+		os.Exit(1)
 	}
 }

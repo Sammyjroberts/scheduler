@@ -31,6 +31,20 @@ type Statistics struct {
 	RejectedTasks  int `json:"rejected_tasks"`
 }
 
+// RejectionReason represents why a task was rejected
+type RejectionReason string
+
+const (
+	RejectionReasonConflict    RejectionReason = "CONFLICT"
+	RejectionReasonLowPriority RejectionReason = "LOW_PRIORITY"
+)
+
+type RejectedTask struct {
+	TaskRejected Task            `json:"task_rejected"`
+	CausedBy     *Task           `json:"caused_by"`
+	Reason       RejectionReason `json:"reason"`
+}
+
 type TimeRange struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
